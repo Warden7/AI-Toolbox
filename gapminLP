@@ -1,0 +1,120 @@
+#include <AIToolbox/POMDP/Algorithms/Utils/WitnessLP.hpp>
+
+#include <lpsolve/lp_lib.h>
+
+namespace AIToolbox::POMDP {
+    // Row is initialized to cols+1 since lp_solve reads element from 1 onwards
+    WitnessLP::WitnessLP(const size_t s) : S(s), lp_(s+2)
+    {
+        /*
+         * In order to obtain the linear approximation for the upper bound of
+         * the input belief, given that we already know the values for a set of
+         * belief, we need to solve an LP in the form:
+         *
+         * c[0] * b[0][0] + c[1] * b[1][0] + ...                = bin[0]
+         * c[0] * b[0][1] + c[1] * b[1][1] + ...                = bin[1]
+         * c[0] * b[0][2] + c[1] * b[1][2] + ...                = bin[2]
+         * ...
+         * c[0] * v[0]    + c[1] * v[1]    + ... - K            = 0
+         *
+         * And we minimize K to get:
+         *
+         * argmin(c) = sum( c * v ) = K
+         *
+         * This way K will be the minimum upper bound possible for the input
+         * belief (bin), found by interpolating all other known beliefs. At the
+         * same time we apply the linear approximation by enforcing
+         *
+         * sum( c * b ) = bin
+         *
+         * We also set each c to be >= 0.
+         *
+         * OPTIMIZATIONS:
+         *
+         * Once we have defined the problem, we can apply a series of
+         * optimizations to reduce the size of the LP to be solved. These were
+         * taken from the MATLAB code published for the GapMin algorithm. Written
+         * interpretation below is mine.
+         *
+         * - Nonzero & Compatible Beliefs
+         *
+         * If the input belief is restricted to a subset of dimensions in the
+         * VFunction (meaning some of its values are zero), and we have beliefs
+         * in that exact same subset, we can just use those in order to determine
+         * the upper bound of the input. This is true since additional dimensions
+         * won't affect the ValueFunction in the particular subspace the input
+         * belief is in. All other beliefs are discarded. Note that we'll need
+         * to fill in zeroes for the coefficients of the discarded beliefs after
+         * we are done.
+         *
+         * - Removal of Corner Values
+         *
+         * Ideally, one would want the corner beliefs/values to be included in
+         * the list of beliefs to use for interpolation, since they are needed.
+         * However, all other belief values can simply be scaled down as if the
+         * corner values were zero, and the resulting solution would not change.
+         * The only thing is that the values obtained for the target function
+         * would need to be scaled back before being returned by the LP.
+         *
+         */
+
+        // Goal: maximize delta.
+        lp_.setObjective(S+1, true);
+
+        // CONSTRAINT: This is the simplex constraint (beliefs sum to 1)
+        {
+            // Note: lp_solve reads elements from 1 onwards, so we don't set row[0]
+            for ( size_t i = 0; i < S; ++i )
+                lp_.row[i] = 1.0;
+            lp_.row[S]     = 0.0; // magic coefficient
+            lp_.row[S + 1] = 0.0; // delta coefficient
+            // The cols value doesn't really do anything here, the whole row is read
+            lp_.pushRow(LP::Constraint::Equal, 1.0);
+        }
+
+        // IMPORTANT: K is unbounded, since the value function may be negative.
+        lp_.setUnbounded(S);
+
+        lp_.row[S]     = -1.0;
+        lp_.row[S + 1] = +0.0;
+    }
+
+    void WitnessLP::addOptimalRow(const MDP::Values & v) {
+        for ( size_t i = 0; i < S; ++i )
+            lp_.row[i] = v[i];
+        // Temporarily set the delta constraint
+        lp_.row[S+1] = +1.0;
+        lp_.pushRow(LP::Constraint::LessEqual, 0.0);
+
+        lp_.row[S+1] = 0.0;
+    }
+
+    std::optional<POMDP::Belief> WitnessLP::findWitness(const MDP::Values & v) {
+        // Add witness constraint
+        for ( size_t i = 0; i < S; ++i )
+            lp_.row[i] = v[i];
+        lp_.pushRow(LP::Constraint::Equal, 0.0);
+
+        double deltaValue;
+        auto solution = lp_.solve(S, &deltaValue);
+
+        // Remove it
+        lp_.popRow();
+
+        // We have found a witness point if we have found a belief for which the value
+        // of the supplied ValueFunction is greater than ALL others. Thus we just need
+        // to verify that the variable we have maximixed is actually greater than 0.
+        if (deltaValue <= 0)
+            solution.reset();
+
+        return solution;
+    }
+
+    void WitnessLP::reset() {
+        lp_.resize(1);
+    }
+
+    void WitnessLP::allocate(const size_t rows) {
+        lp_.resize(rows+1);
+    }
+}
