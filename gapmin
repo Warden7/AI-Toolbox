@@ -1,40 +1,3 @@
-VList pureStrategies(const POMDP & pomdp, double epsilon) {
-    const auto ir = MDP::computeImmediateRewards(pomdp);
-    // This function produces a very simple lower bound for the POMDP. The
-    // bound for each action is computed assuming to take the same action forever
-    // (so the bound for action 0 assumes to forever take action 0, the bound for
-    // action 1 assumes to take action 1, etc.).
-    VList retval;
-
-    for (size_t a = 0; a < pomdp.getA(); ++a) {
-        auto newAlpha = Vector(pomdp.getS());
-        auto oldAlpha = Vector(pomdp.getS());
-        oldAlpha.fill(ir.col(a).minCoeff() / (1.0 - pomdp.getDiscount())); // FIXME: infinity
-
-        while (true) {
-            if constexpr(is_eigen_model<M>::value) {
-                newAlpha = ir.row(s) + pomdp.getDiscount() * pomdp.getTransitionFunction(a) * oldAlpha;
-            } else {
-                newAlpha = ir.row(s);
-                for (size_t s = 0; s < pomdp.getS(); ++s) {
-                    double sum = 0.0;
-                    for (size_t s1 = 0; s1 < pomdp.getS(); ++s1)
-                        sum += pomdp.getTransitionProbability(s, a, s1) * oldAlpha[s1];
-                    newAlpha[s] += pomdp.getDiscount() * sum;
-                }
-            }
-            const auto variation = (oldAlpha - newAlpha).cwiseAbs().maxCoeff();
-            if (variation < epsilon)
-                break;
-
-            oldAlpha = newAlpha;
-        }
-        retval.emplace_back(std::move(newAlpha), a, VObs(0));
-    }
-    retval.erase(extractDominated(S, retval., wend), std::end(w));
-    return retval;
-}
-
 Matrix2D solveFIB(const POMDP & pomdp, const boost::multi_array<Matrix2D, 2> & pomdpSOSA, Matrix2D oldAlpha = Matrix2D()) {
     const auto ir = MDP::computeImmediateRewards(pomdp);
     Matrix2D newAlpha(S, A);
@@ -64,14 +27,23 @@ Matrix2D solveFIB(const POMDP & pomdp, const boost::multi_array<Matrix2D, 2> & p
 }
 
 void gapMin(POMDP pomdp, Belief initialBelief) {
-    auto lbVList = pureStrategies(pomdp, eps);
+    BlindStrategies bs(1000000, eps);
+    auto lbVList = bs(pomdp, true);
+    {
+        const auto unwrap = +[](VEntry & ve) -> MDP::Values & {return std::get<VALUES>(ve);};
+        const auto rbegin = boost::make_transform_iterator(std::begin(lbVList), unwrap);
+        const auto rend   = boost::make_transform_iterator(std::end  (lbVList), unwrap);
+
+        lbVList.erase(extractDominated(m.getS(), rbegin, rend).base(), std::end(lbVList));
+    }
+
     auto lbBeliefs = std::vector{initialBelief};
 
     auto pomdpSOSA = makeSOSA(pomdp); // Put this in utils (A,O --> S, S', see projecter)
     auto ubQ = solveFIB(pomdp, pomdpSOSA);
     fibQ = {ubQ, initialBelief * ubQ};
     ubV = {
-        {initialBelief, fibQ.last().maxCoeff() }
+        {initialBelief, fibQ.last().maxCoeff()}
     };
 
     // Init begin ub/lb
@@ -120,6 +92,57 @@ void gapMin(POMDP pomdp, Belief initialBelief) {
 
         var = ub - lb;
     }
+}
+
+std::tuple<double, Vector> UB(const Belief & belief, const MDP::QFunction & ubQ, ubV) {
+    double ubVal = (belief * ubQ).maxCoeff();
+
+    std::vector<size_t> zeroStates;
+    for (size_t s = 0; s < belief.size(); ++s)
+        if (checkEqualSmall(belief[s], 0.0))
+            zeroStates.push_back(s);
+
+    std::vector<size_t> compatibleBeliefs;
+    for (size_t i = 0; i < ubV.size(); ++i) {
+        bool add = true;
+        for (const auto s : zeroStates) {
+            if (checkDifferentSmall(ubV[i].first[s], 0.0)) {
+                add = false;
+                break;
+            }
+        }
+        if (add) compatibleBeliefs.push_back(i);
+    }
+
+    // There's no other beliefs on the same plane as this one, so the V can't
+    // help us with the bound.
+    if (compatibleBeliefs.size() == 0) {
+        Vector retval(belief.size() + ubV.size());
+        for (size_t s = 0; s < belief.size(); ++s)
+            retval[s] = belief[s];
+        for (size_t s = belief.size(); s < ubV.size(); ++s)
+            retval[s] = 0.0;
+        return std::make_tuple(ubVal, std::move(retval));
+    }
+
+    // Set columns = compatibleBeliefs.size() + 1; // One column per belief, plus one.
+    // Set rows = belief.size() - zeroStates.size() + 1; // One row per state, plus one.
+    for (const auto b : compatibleBeliefs) {
+        size_t i = 0;
+        for (const auto s : zeroStates)
+            lp.row[i++] = ubV[b].first[s];
+        lp.push_row(EQ, belief[s]);
+    }
+
+    size_t i = 0;
+    for (const auto b : compatibleBeliefs) {
+        double val = ubV[b].second;
+        for (const auto s : zeroStates)
+            val -= ubV[b].first[s] * cornerVal[s];
+        lp.row[i++] = val;
+    }
+    lp.row[i] = -1.0;
+    lp.push_row(EQ, 0.0);
 }
 
 std::tuple<std::vector<Belief>, std::vector<Belief>, std::vector<double>> selectReachableBeliefs(const POMDP & pomdp, ...) {
